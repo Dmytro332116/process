@@ -13,6 +13,9 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+=======
+
 from typing import Iterator, List, Optional, Sequence, Tuple, Union
 
 from typing import Iterator, List, Optional, Sequence, Tuple
@@ -88,6 +91,51 @@ class CategoryRecord:
         level_values = [str(row.get(col, "") or "").strip() for col in CATEGORY_LEVELS]
         combined = " > ".join([val for val in level_values if val])
         return cls(level_values[0], level_values[1], level_values[2], combined)
+=======
+
+NUMERIC_TOKEN_RE = re.compile(r"(\d+)")
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+@dataclass
+class CategoryRecord:
+    """Represents a single category row."""
+
+
+    level1: str
+    level2: str
+    level3: str
+    combined: str
+
+@dataclass
+class CategoryContext:
+    """Precomputed helpers for category matching."""
+
+    records: Sequence[CategoryRecord]
+    exact_patterns: List[Tuple[CategoryRecord, List[re.Pattern]]]
+    fuzzy_choices: List[str]
+    fuzzy_map: Dict[str, CategoryRecord]
+    form_factor_map: Dict[str, List[CategoryRecord]]
+
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+def detect_encoding(raw: bytes) -> str:
+    """Detect file encoding with chardet."""
+
+    result = chardet.detect(raw)
+    encoding = result.get("encoding") or "utf-8"
+    return encoding
+
+=======
+    @classmethod
+    def from_row(cls, row: pd.Series) -> "CategoryRecord":
+        level_values = [str(row.get(col, "") or "").strip() for col in CATEGORY_LEVELS]
+        combined = " > ".join([val for val in level_values if val])
+        return cls(level_values[0], level_values[1], level_values[2], combined)
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -128,7 +176,6 @@ def detect_encoding(raw: bytes) -> str:
     encoding = result.get("encoding") or "utf-8"
     return encoding
 
-
 def detect_separator(sample: str) -> str:
     """Detect separator by counting separators in the header sample."""
 
@@ -146,6 +193,10 @@ def detect_separator(sample: str) -> str:
         return ","
 
 
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names by stripping whitespace and removing BOM."""
+
+=======
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize column names by stripping whitespace and removing BOM."""
@@ -153,7 +204,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize column names by stripping whitespace and removing BOM."""
-
 
     mapping = {}
     for col in df.columns:
@@ -177,10 +227,13 @@ def clean_text(value: Optional[str]) -> str:
 
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Clean all text fields in a DataFrame."""
-
+    
     for column in df.columns:
         df[column] = df[column].apply(clean_text)
 
+
+    for column in df.columns:
+        df[column] = df[column].apply(clean_text)
     return df
 
 
@@ -192,6 +245,117 @@ def numeric_sort_key(value: Union[str, Path]) -> Tuple[int, str]:
     number = int(match.group(1)) if match else sys.maxsize
     return number, name.lower()
 
+
+def build_word_pattern(phrase: str) -> re.Pattern:
+    """Build a regex pattern that enforces word-boundary matching."""
+
+    normalized = clean_text(phrase).lower()
+    if not normalized:
+        return re.compile(r"^$")
+    tokens = [re.escape(token) for token in re.split(r"\s+", normalized) if token]
+    if not tokens:
+        tokens = [re.escape(normalized)]
+    pattern = r"\b" + r"\s+".join(tokens) + r"\b"
+    return re.compile(pattern)
+
+
+def record_depth(record: CategoryRecord) -> int:
+    """Return how deep the record goes in the hierarchy."""
+
+    if record.level3:
+        return 3
+    if record.level2:
+        return 2
+    if record.level1:
+        return 1
+    return 0
+
+
+def normalize_atc_code(atc_code: str) -> str:
+    """Normalize ATC code to the first three alphanumeric characters."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", atc_code or "").upper()
+    return cleaned[:3]
+
+
+# ---------------------------------------------------------------------------
+# File reading helpers
+# ---------------------------------------------------------------------------
+def read_csv_from_bytes(raw: bytes, source: str) -> pd.DataFrame:
+    """Read CSV content from raw bytes."""
+
+    encoding = detect_encoding(raw)
+    text = raw.decode(encoding, errors="replace")
+    text = text.replace("\ufeff", "")
+    sep = detect_separator(text[:1024])
+    buffer = io.StringIO(text)
+    try:
+        df = pd.read_csv(
+            buffer,
+            sep=sep,
+            dtype=str,
+            on_bad_lines="skip",
+            engine="python" if sep != "," else "c",
+        )
+    except Exception:
+        buffer.seek(0)
+        df = pd.read_csv(buffer, dtype=str, on_bad_lines="skip", sep=None, engine="python")
+    df["source_file"] = source
+    return df
+
+
+def iter_csv_contents(input_path: Path) -> Iterator[Tuple[str, bytes]]:
+    """Yield (name, raw_bytes) for each CSV file in the input path/zip."""
+
+    if input_path.is_file() and input_path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(input_path, "r") as archive:
+            csv_members = [
+                member
+                for member in archive.namelist()
+                if member.lower().endswith(".csv") and not member.endswith("/")
+            ]
+            for member in sorted(csv_members, key=numeric_sort_key):
+                logging.info("Reading %s from ZIP", member)
+                yield member, archive.read(member)
+    elif input_path.is_dir():
+        csv_files = sorted(
+            (path for path in input_path.rglob("*.csv") if path.is_file()),
+            key=numeric_sort_key,
+        )
+        for file_path in csv_files:
+            logging.info("Reading %s", file_path)
+            yield file_path.name, file_path.read_bytes()
+    elif input_path.is_file() and input_path.suffix.lower() == ".csv":
+        logging.info("Reading single CSV %s", input_path)
+        yield input_path.name, input_path.read_bytes()
+    else:
+        raise FileNotFoundError(f"Unsupported input path: {input_path}")
+
+
+def load_products(input_path: Path) -> pd.DataFrame:
+    """Load all product CSV files into a single DataFrame."""
+
+    frames: List[pd.DataFrame] = []
+    for name, raw in iter_csv_contents(input_path):
+        try:
+            frame = read_csv_from_bytes(raw, name)
+            logging.info("Loaded %s rows from %s", len(frame), name)
+            frames.append(frame)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.error("Failed to parse %s: %s", name, exc)
+    if not frames:
+        raise RuntimeError("No CSV data could be loaded from input.")
+    df = pd.concat(frames, ignore_index=True)
+    logging.info("Merged %s rows from %s files", len(df), len(frames))
+    return df
+
+
+def ensure_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    """Ensure expected columns exist in DataFrame."""
+
+    for column in columns:
+        if column not in df.columns:
+            df[column] = ""
 
 # ---------------------------------------------------------------------------
 # File reading helpers
@@ -299,6 +463,11 @@ def build_category_records(category_df: pd.DataFrame) -> List[CategoryRecord]:
 
 
 # ---------------------------------------------------------------------------
+# Category helpers
+# ---------------------------------------------------------------------------
+def load_categories(category_path: Path) -> pd.DataFrame:
+    """Load category structure CSV."""
+
 # File reading helpers
 # ---------------------------------------------------------------------------
 def read_csv_from_bytes(raw: bytes, source: str) -> pd.DataFrame:
@@ -396,6 +565,42 @@ def build_category_records(category_df: pd.DataFrame) -> List[CategoryRecord]:
     return records
 
 
+def build_category_context(records: Sequence[CategoryRecord]) -> CategoryContext:
+    """Precompute helper structures used during matching."""
+
+    exact_patterns: List[Tuple[CategoryRecord, List[re.Pattern]]] = []
+    for record in records:
+        patterns = []
+        for level in (record.level3, record.level2, record.level1):
+            if level:
+                patterns.append(build_word_pattern(level))
+        exact_patterns.append((record, patterns))
+
+    fuzzy_choices = [record.combined for record in records if record.combined]
+    fuzzy_map = {record.combined: record for record in records if record.combined}
+
+    keyword_set = {value.lower() for value in FORM_FACTOR_KEYWORDS.values() if value}
+    form_factor_map: Dict[str, List[CategoryRecord]] = {keyword: [] for keyword in keyword_set}
+    for record in records:
+        combined_lower = record.combined.lower()
+        for keyword in form_factor_map:
+            if keyword and keyword in combined_lower:
+                form_factor_map[keyword].append(record)
+
+    return CategoryContext(records, exact_patterns, fuzzy_choices, fuzzy_map, form_factor_map)
+
+
+# ---------------------------------------------------------------------------
+# Category assignment strategies
+# ---------------------------------------------------------------------------
+def exact_keyword_match(text: str, context: CategoryContext) -> Optional[CategoryRecord]:
+    """Strategy A: exact keyword matching on category levels using word boundaries."""
+
+    text_lower = text.lower()
+    for record, patterns in context.exact_patterns:
+        for pattern in patterns:
+            if pattern.search(text_lower):
+
 # ---------------------------------------------------------------------------
 # Category assignment strategies
 # ---------------------------------------------------------------------------
@@ -409,6 +614,72 @@ def exact_keyword_match(text: str, records: Sequence[CategoryRecord]) -> Optiona
                 return record
     return None
 
+
+def fuzzy_match(text: str, context: CategoryContext) -> Tuple[Optional[CategoryRecord], Optional[float]]:
+    """Strategy B: fuzzy matching against combined categories."""
+
+    if not text.strip() or not context.fuzzy_choices:
+        return None, None
+    match = rf_process.extractOne(text, context.fuzzy_choices, scorer=fuzz.WRatio)
+    if match and match[1] >= 60:
+        return context.fuzzy_map.get(match[0]), float(match[1])
+    return None, float(match[1]) if match else None
+
+
+def form_factor_match(text: str, context: CategoryContext) -> Optional[CategoryRecord]:
+    """Strategy C: match by detected form factor keywords."""
+
+    text_lower = text.lower()
+    candidates: List[Tuple[int, CategoryRecord]] = []
+    for fragment, keyword in FORM_FACTOR_KEYWORDS.items():
+        if fragment in text_lower:
+            keyword_lower = keyword.lower()
+            for record in context.form_factor_map.get(keyword_lower, []):
+                candidates.append((record_depth(record), record))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1].combined))
+    return candidates[0][1]
+
+
+def atc_match(atc_code: str, context: CategoryContext) -> Optional[CategoryRecord]:
+    """Strategy D: map ATC code prefixes to categories."""
+
+    prefix = normalize_atc_code(atc_code)
+    if not prefix:
+        return None
+    hint = ATC_CATEGORY_HINTS.get(prefix)
+    if not hint:
+        return None
+    for record in context.records:
+        if record.level1.lower() == hint.lower():
+            return record
+    return None
+
+
+def assign_category_to_row(
+    row: pd.Series, context: CategoryContext
+) -> Tuple[str, str, str, str, str]:
+    """Assign category levels to a single product row."""
+
+    combined_text = " ".join([row.get(field, "") or "" for field in TEXT_FIELDS])
+    combined_text = clean_text(combined_text)
+    strategy = ""
+    fuzzy_score: Optional[float] = None
+
+    record = exact_keyword_match(combined_text, context)
+    if record:
+        strategy = "exact"
+    else:
+        record, fuzzy_score = fuzzy_match(combined_text, context)
+        if record:
+            strategy = "fuzzy"
+    if not record:
+        record = form_factor_match(combined_text, context)
+        if record:
+            strategy = "form-factor"
+    if not record:
+        record = atc_match(row.get("Код АТС", ""), context)
 
 def fuzzy_match(text: str, records: Sequence[CategoryRecord]) -> Optional[CategoryRecord]:
     """Strategy B: fuzzy matching against combined categories."""
@@ -534,7 +805,18 @@ def assign_category_to_row(
             strategy = "atc"
 
     if record:
+
+        logging.debug(
+            "Row text: %s -> assigned: %s via %s%s",
+            combined_text,
+            record.combined,
+            strategy,
+            f" (score={fuzzy_score:.1f})" if fuzzy_score is not None else "",
+        )
         return record.level1, record.level2, record.level3, record.combined, strategy
+    logging.debug("Row text: %s -> assigned: Невизначено via unassigned", combined_text)
+        return record.level1, record.level2, record.level3, record.combined, strategy
+
     return "", "", "", "Невизначено", "unassigned"
 
 
@@ -542,6 +824,9 @@ def assign_categories(df: pd.DataFrame, records: Sequence[CategoryRecord]) -> pd
     """Assign categories to the full DataFrame using all strategies."""
 
     stats: Counter[str] = Counter()
+
+    context = build_category_context(records)
+    assignments = df.apply(lambda row: assign_category_to_row(row, context), axis=1)
     assignments = df.apply(lambda row: assign_category_to_row(row, records), axis=1)
     df[["Категорія1", "Категорія2", "Категорія3", "CombinedCategory", "_strategy"]] = list(assignments)
     stats.update(df["_strategy"].value_counts().to_dict())
@@ -588,6 +873,19 @@ def process_data(input_path: Path, category_path: Path, output_path: Path) -> No
 # ---------------------------------------------------------------------------
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse CLI arguments."""
+
+    parser = argparse.ArgumentParser(description="Process medical product exports.")
+    parser.add_argument("--input", required=True, help="Path to input CSV/ZIP folder")
+    parser.add_argument("--categories", required=True, help="Path to category CSV file")
+    parser.add_argument("--output", required=True, help="Path to output CSV file")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging verbosity",
+    )
+    return parser.parse_args(argv)
+
 
     parser = argparse.ArgumentParser(description="Process medical product exports.")
     parser.add_argument("--input", required=True, help="Path to input CSV/ZIP folder")
